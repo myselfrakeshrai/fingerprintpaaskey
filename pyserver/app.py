@@ -9,6 +9,7 @@ from flask_cors import CORS
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from secrets import token_bytes
 import time
+from werkzeug.security import generate_password_hash, check_password_hash
 
 from webauthn import (
     verify_registration_response,
@@ -101,6 +102,15 @@ def init_db() -> None:
             )
             """
         )
+        # Add new columns if they don't exist yet
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS credentials (
@@ -120,7 +130,7 @@ def init_db() -> None:
 
 def get_user(conn: sqlite3.Connection, username: str) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT username, user_id, allowed_devices, fingerprint_hash FROM users WHERE username = ?",
+        "SELECT username, user_id, allowed_devices, fingerprint_hash, email, password_hash FROM users WHERE username = ?",
         (username,),
     ).fetchone()
 
@@ -175,6 +185,45 @@ def update_allowed_devices(conn: sqlite3.Connection, username: str, devices: lis
         "UPDATE users SET allowed_devices = ? WHERE username = ?",
         (json.dumps(devices), username),
     )
+
+
+def ensure_auth_columns(conn: sqlite3.Connection) -> None:
+    """Ensure optional auth columns exist even if init_db didn't run this boot."""
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+
+def set_user_auth_fields(
+    conn: sqlite3.Connection,
+    username: str,
+    *,
+    email: str | None = None,
+    password_hash: str | None = None,
+    fingerprint_hash: str | None = None,
+) -> None:
+    # Build dynamic update based on provided fields
+    fields: list[str] = []
+    values: list[object] = []
+    if email is not None:
+        fields.append("email = ?")
+        values.append(email)
+    if password_hash is not None:
+        fields.append("password_hash = ?")
+        values.append(password_hash)
+    if fingerprint_hash is not None:
+        fields.append("fingerprint_hash = ?")
+        values.append(fingerprint_hash)
+    if not fields:
+        return
+    values.append(username)
+    sql = f"UPDATE users SET {', '.join(fields)} WHERE username = ?"
+    conn.execute(sql, tuple(values))
 
 
 # --------------------------------------------------------------------------------------
@@ -335,6 +384,136 @@ def verify_registration():
     except Exception as exc:
         logger.exception("[VERIFY REGISTER] error")
         return jsonify({"message": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------------------
+# Password + Fingerprint 2FA endpoints
+# --------------------------------------------------------------------------------------
+
+# In-memory short-lived tokens created after password verification
+password_ok_tokens: dict[str, dict[str, object]] = {}
+
+
+@app.post("/register-password")
+def register_password():
+    payload: Dict[str, Any] = request.get_json(force=True)
+    username: str = (payload.get("username") or "").strip()
+    email: str = (payload.get("email") or "").strip()
+    password: str = (payload.get("password") or "").strip()
+    fingerprint: str = (payload.get("fingerprint") or "").strip()
+    fingerprint_hash_from_device: str = (payload.get("fingerprintHash") or "").strip()
+
+    if not username or not email or not password:
+        return jsonify({"message": "Missing required fields"}), 400
+
+    conn = get_db()
+    try:
+        with conn:
+            ensure_auth_columns(conn)
+            row = get_user(conn, username)
+            if row is None:
+                user_id = token_bytes(16)
+                insert_user(conn, username, user_id)
+                row = get_user(conn, username)
+            # Do not overwrite existing credentials
+            if row.get("password_hash") if isinstance(row, dict) else row["password_hash"]:
+                return jsonify({"message": "User already registered with password"}), 400
+
+            pwd_hash = generate_password_hash(password, method="pbkdf2:sha256", salt_length=16)
+            # If a device-provided fingerprint hash is present, we hash THAT value for storage.
+            # Otherwise, if a raw fingerprint string is present, we hash that.
+            fp_source = fingerprint_hash_from_device or fingerprint or None
+            fp_hash = (
+                generate_password_hash(fp_source, method="pbkdf2:sha256", salt_length=16)
+                if fp_source
+                else None
+            )
+            set_user_auth_fields(
+                conn,
+                username,
+                email=email,
+                password_hash=pwd_hash,
+                fingerprint_hash=fp_hash,
+            )
+        return jsonify({"message": "Registration successful"})
+    except Exception as exc:
+        logger.exception("[REGISTER PASSWORD] error")
+        return jsonify({"message": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.post("/login-password")
+def login_password():
+    payload: Dict[str, Any] = request.get_json(force=True)
+    username: str = (payload.get("username") or "").strip()
+    password: str = (payload.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"message": "Missing fields"}), 400
+
+    conn = get_db()
+    try:
+        row = get_user(conn, username)
+        if row is None or not (row.get("password_hash") if isinstance(row, dict) else row["password_hash"]):
+            return jsonify({"message": "Invalid username or password"}), 401
+        if not check_password_hash(row.get("password_hash") if isinstance(row, dict) else row["password_hash"], password):
+            return jsonify({"message": "Invalid username or password"}), 401
+
+        token = b64url_encode(token_bytes(24))
+        password_ok_tokens[username] = {"token": token, "exp": time.time() + 300.0}
+        return jsonify({"message": "Password OK", "passwordToken": token})
+    except Exception as exc:
+        logger.exception("[LOGIN PASSWORD] error")
+        return jsonify({"message": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.post("/verify-fingerprint")
+def verify_fingerprint():
+    payload: Dict[str, Any] = request.get_json(force=True)
+    username: str = (payload.get("username") or "").strip()
+    fingerprint: str = (payload.get("fingerprint") or "").strip()
+    fingerprint_hash_from_device: str = (payload.get("fingerprintHash") or "").strip()
+    device_id: str = (payload.get("deviceId") or "device123").strip()
+    token: str = (payload.get("passwordToken") or "").strip()
+
+    if not username or not token:
+        return jsonify({"message": "Missing fields"}), 400
+
+    # Validate short-lived password token
+    entry = password_ok_tokens.get(username)
+    if not entry or entry.get("token") != token or float(entry.get("exp", 0)) < time.time():
+        return jsonify({"message": "Password verification required"}), 401
+
+    conn = get_db()
+    try:
+        row = get_user(conn, username)
+        if row is None or not row["fingerprint_hash"]:
+            return jsonify({"message": "Fingerprint not enrolled"}), 400
+        # Candidate to verify: prefer device-provided hash, fallback to raw fingerprint string
+        candidate = fingerprint_hash_from_device or fingerprint
+        if not candidate:
+            return jsonify({"message": "Missing fingerprint"}), 400
+        if not check_password_hash(row["fingerprint_hash"], candidate):
+            return jsonify({"message": "Fingerprint mismatch"}), 401
+
+        # Update allowed devices
+        allowed_devices = json.loads(row["allowed_devices"]) if row["allowed_devices"] else []
+        if device_id not in allowed_devices:
+            allowed_devices.append(device_id)
+            with conn:
+                update_allowed_devices(conn, username, allowed_devices)
+
+        # Invalidate token after successful 2FA
+        password_ok_tokens.pop(username, None)
+        return jsonify({"message": "2FA successful"})
+    except Exception as exc:
+        logger.exception("[VERIFY FINGERPRINT] error")
+        return jsonify({"message": str(exc)}), 500
     finally:
         conn.close()
 
