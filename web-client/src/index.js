@@ -5,6 +5,10 @@ import App from './App';
 import reportWebVitals from './reportWebVitals';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import FingerprintTestPage from './pages/FingerprintTestPage';
+import RegisterPage from './pages/RegisterPage';
+import LoginPage from './pages/LoginPage';
+import DashboardPage from './pages/DashboardPage';
+import ForgotTokenPage from './pages/ForgotTokenPage';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(
@@ -12,6 +16,10 @@ root.render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<App />} />
+        <Route path="/register" element={<RegisterPage />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/dashboard" element={<DashboardPage />} />
+        <Route path="/forgottoken" element={<ForgotTokenPage />} />
         <Route path="/fingerprinttest" element={<FingerprintTestPage />} />
       </Routes>
     </BrowserRouter>

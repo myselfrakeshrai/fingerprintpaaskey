@@ -9,11 +9,19 @@ from flask_cors import CORS
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from secrets import token_bytes
 import time
+import random
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
 
 from webauthn import (
     verify_registration_response,
     verify_authentication_response,
 )
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --------------------------------------------------------------------------------------
 # Paths and setup
@@ -21,7 +29,7 @@ from webauthn import (
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "log"
 DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "app.db"
+DB_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "app.db"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PID_FILE = BASE_DIR / "server.pid"
@@ -75,8 +83,24 @@ RP_NAME = "Fingerprint 2FA App"
 RP_ID = "localhost"  # domain part only
 EXPECTED_ORIGIN = "http://localhost:3000"
 
+# Email configuration from environment variables
+EMAIL_SMTP_SERVER = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com")
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+EMAIL_USERNAME = os.getenv("EMAIL_USERNAME", "your-email@gmail.com")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "your-app-password")
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "SecureAuth")
+
 # In-memory challenges per username
 username_to_challenge: Dict[str, str] = {}
+
+# Backup tokens list
+BACKUP_TOKENS = [
+    "cat", "dog", "bird", "fish", "lion", "tiger", "bear", "wolf", "fox", "deer",
+    "mango", "apple", "banana", "orange", "grape", "cherry", "lemon", "lime", "peach", "pear",
+    "giraffe", "elephant", "zebra", "hippo", "rhino", "panda", "koala", "kangaroo", "monkey", "penguin",
+    "ocean", "mountain", "forest", "desert", "river", "lake", "valley", "canyon", "island", "beach",
+    "sunset", "rainbow", "thunder", "lightning", "snowflake", "raindrop", "cloud", "star", "moon", "sun"
+]
 
 # --------------------------------------------------------------------------------------
 # SQLite helpers
@@ -97,10 +121,29 @@ def init_db() -> None:
               username TEXT PRIMARY KEY,
               user_id  BLOB NOT NULL,
               allowed_devices TEXT NOT NULL DEFAULT '[]',
-              fingerprint_hash TEXT
+              fingerprint_hash TEXT,
+              backup_token TEXT
             )
             """
         )
+        # Add backup_token column to existing users table if it doesn't exist
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN backup_token TEXT")
+        except sqlite3.OperationalError:
+            # Column already exists, ignore the error
+            pass
+        
+        # Generate backup tokens for existing users who don't have one
+        users_without_tokens = conn.execute(
+            "SELECT username FROM users WHERE backup_token IS NULL OR backup_token = ''"
+        ).fetchall()
+        
+        for user in users_without_tokens:
+            token = generate_backup_token()
+            conn.execute(
+                "UPDATE users SET backup_token = ? WHERE username = ?",
+                (token, user["username"])
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS credentials (
@@ -120,15 +163,16 @@ def init_db() -> None:
 
 def get_user(conn: sqlite3.Connection, username: str) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT username, user_id, allowed_devices, fingerprint_hash FROM users WHERE username = ?",
+        "SELECT username, user_id, allowed_devices, fingerprint_hash, backup_token FROM users WHERE username = ?",
         (username,),
     ).fetchone()
 
 
 def insert_user(conn: sqlite3.Connection, username: str, user_id: bytes) -> None:
+    backup_token = generate_backup_token()
     conn.execute(
-        "INSERT INTO users (username, user_id, allowed_devices) VALUES (?, ?, '[]')",
-        (username, user_id),
+        "INSERT INTO users (username, user_id, allowed_devices, backup_token) VALUES (?, ?, '[]', ?)",
+        (username, user_id, backup_token),
     )
 
 
@@ -148,7 +192,7 @@ def get_credential_by_id(conn: sqlite3.Connection, credential_id: bytes) -> sqli
 
 def get_user_by_user_id(conn: sqlite3.Connection, user_id: bytes) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT username, user_id, allowed_devices, fingerprint_hash FROM users WHERE user_id = ?",
+        "SELECT username, user_id, allowed_devices, fingerprint_hash, backup_token FROM users WHERE user_id = ?",
         (user_id,),
     ).fetchone()
 
@@ -188,6 +232,11 @@ def b64url_encode(data: bytes) -> str:
 def b64url_decode(s: str) -> bytes:
     padding = '=' * (-len(s) % 4)
     return urlsafe_b64decode(s + padding)
+
+
+def generate_backup_token() -> str:
+    """Generate a random backup token with 7 random words from the predefined list"""
+    return " ".join(random.choices(BACKUP_TOKENS, k=7))
 
 
 @app.before_request
@@ -331,7 +380,15 @@ def verify_registration():
                 transports_json,
             )
         username_to_challenge.pop(username, None)
-        return jsonify({"message": "Registration successful"})
+        
+        # Get the generated backup token
+        user_row = get_user(conn, username)
+        backup_token = user_row["backup_token"] if user_row else None
+        
+        return jsonify({
+            "message": "Registration successful", 
+            "backup_token": backup_token
+        })
     except Exception as exc:
         logger.exception("[VERIFY REGISTER] error")
         return jsonify({"message": str(exc)}), 400
@@ -413,19 +470,13 @@ def verify_authentication():
         if len(creds) == 0:
             return jsonify({"message": "No credentials registered"}), 400
 
-        authenticator = {
-            "credential_id": creds[0]["credential_id"],
-            "credential_public_key": creds[0]["credential_public_key"],
-            "sign_count": creds[0]["sign_count"],
-            "transports": json.loads(creds[0]["transports"]) if creds[0]["transports"] else None,
-        }
-
         _verification = verify_authentication_response(
             credential=response,
             expected_challenge=expected_challenge,
             expected_rp_id=RP_ID,
             expected_origin=EXPECTED_ORIGIN,
-            authenticator=authenticator,
+            credential_public_key=creds[0]["credential_public_key"],
+            credential_current_sign_count=creds[0]["sign_count"],
         )
         # If no exception, consider verified
 
@@ -502,19 +553,13 @@ def verify_authentication_any():
         if user_row is None:
             return jsonify({"message": "User not found for this credential"}), 404
 
-        authenticator = {
-            "credential_id": cred_row["credential_id"],
-            "credential_public_key": cred_row["credential_public_key"],
-            "sign_count": cred_row["sign_count"],
-            "transports": json.loads(cred_row["transports"]) if cred_row["transports"] else None,
-        }
-
         _verification = verify_authentication_response(
             credential=response,
             expected_challenge=expected_challenge,
             expected_rp_id=RP_ID,
             expected_origin=EXPECTED_ORIGIN,
-            authenticator=authenticator,
+            credential_public_key=cred_row["credential_public_key"],
+            credential_current_sign_count=cred_row["sign_count"],
         )
 
         # Update device list for the resolved user
@@ -532,6 +577,180 @@ def verify_authentication_any():
         conn.close()
 
 
+# --------------------------------------------------------------------------------------
+# Token-based Authentication (Backup)
+# --------------------------------------------------------------------------------------
+@app.post("/login-token")
+def login_with_token():
+    payload: Dict[str, Any] = request.get_json(force=True)
+    username = (payload.get("username") or "").strip()
+    token = (payload.get("token") or "").strip()
+    device_id = (payload.get("deviceId") or "device123").strip()
+
+    if not username or not token:
+        return jsonify({"message": "Missing username or token"}), 400
+
+    conn = get_db()
+    try:
+        row = get_user(conn, username)
+        if row is None:
+            return jsonify({"message": "User not found"}), 404
+
+        stored_token = row["backup_token"]
+        if not stored_token or token.lower().strip() != stored_token.lower().strip():
+            return jsonify({"message": "Invalid token"}), 401
+
+        # Update device list
+        allowed_devices = json.loads(row["allowed_devices"]) if row["allowed_devices"] else []
+        if device_id not in allowed_devices:
+            allowed_devices.append(device_id)
+            with conn:
+                update_allowed_devices(conn, username, allowed_devices)
+
+        logger.info(f"[TOKEN LOGIN] successful for {username}")
+        return jsonify({"message": "Token login successful"})
+    except Exception as exc:
+        logger.exception("[TOKEN LOGIN] error")
+        return jsonify({"message": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.get("/get-backup-token/<username>")
+def get_backup_token(username: str):
+    """Get the backup token for a user (for display purposes)"""
+    conn = get_db()
+    try:
+        row = get_user(conn, username)
+        if row is None:
+            return jsonify({"message": "User not found"}), 404
+
+        token = row["backup_token"]
+        if not token:
+            return jsonify({"message": "No backup token found"}), 404
+
+        return jsonify({"token": token})
+    except Exception as exc:
+        logger.exception("[GET TOKEN] error")
+        return jsonify({"message": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.post("/regenerate-backup-token")
+def regenerate_backup_token():
+    """Regenerate backup token for a user"""
+    payload: Dict[str, Any] = request.get_json(force=True)
+    username = (payload.get("username") or "").strip()
+
+    if not username:
+        return jsonify({"message": "Missing username"}), 400
+
+    conn = get_db()
+    try:
+        row = get_user(conn, username)
+        if row is None:
+            return jsonify({"message": "User not found"}), 404
+
+        # Generate new 7-word token
+        new_token = generate_backup_token()
+        
+        with conn:
+            conn.execute(
+                "UPDATE users SET backup_token = ? WHERE username = ?",
+                (new_token, username)
+            )
+
+        logger.info(f"[REGENERATE TOKEN] new token generated for {username}")
+        return jsonify({"message": "Token regenerated successfully", "token": new_token})
+    except Exception as exc:
+        logger.exception("[REGENERATE TOKEN] error")
+        return jsonify({"message": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    """Send email using SMTP"""
+    try:
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_USERNAME}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        # Add body to email
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Create SMTP session
+        server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT)
+        server.starttls()  # Enable security
+        server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        
+        # Send email
+        text = msg.as_string()
+        server.sendmail(EMAIL_USERNAME, to_email, text)
+        server.quit()
+        
+        logger.info(f"[EMAIL] Successfully sent email to {to_email}")
+        return True
+    except Exception as exc:
+        logger.exception(f"[EMAIL] Failed to send email to {to_email}")
+        return False
+
+
+@app.post("/forgot-token")
+def forgot_token():
+    """Send backup token to user's email"""
+    payload: Dict[str, Any] = request.get_json(force=True)
+    email = (payload.get("email") or "").strip()
+
+    if not email:
+        return jsonify({"message": "Email is required"}), 400
+
+    conn = get_db()
+    try:
+        row = get_user(conn, email)
+        if row is None:
+            return jsonify({"message": "User not found"}), 404
+
+        backup_token = row["backup_token"]
+        if not backup_token:
+            return jsonify({"message": "No backup token found for this user"}), 404
+
+        # Send email with backup token
+        subject = "Your SecureAuth Backup Token"
+        body = f"""
+Hello,
+
+You requested your backup token for SecureAuth.
+
+Your backup token is: {backup_token}
+
+This token contains 7 random words for enhanced security.
+
+Important Security Notes:
+- Keep this token safe and don't share it with anyone
+- You can use this token to login if your fingerprint doesn't work
+- If you didn't request this token, please contact support immediately
+
+Best regards,
+SecureAuth Team
+        """.strip()
+
+        if send_email(email, subject, body):
+            logger.info(f"[FORGOT TOKEN] Token sent to {email}")
+            return jsonify({"message": "Backup token sent to your email"})
+        else:
+            return jsonify({"message": "Failed to send email. Please try again later."}), 500
+
+    except Exception as exc:
+        logger.exception("[FORGOT TOKEN] error")
+        return jsonify({"message": str(exc)}), 400
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     init_db()
     # Write PID for external control scripts
@@ -540,5 +759,11 @@ if __name__ == "__main__":
             f.write(str(os.getpid()))
     except Exception:
         pass
-    logger.info("Python WebAuthn server running at http://localhost:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    
+    # Server configuration from environment variables
+    HOST = os.getenv("HOST", "127.0.0.1")
+    PORT = int(os.getenv("PORT", "5000"))
+    DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+    
+    logger.info(f"Python WebAuthn server running at http://{HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, debug=DEBUG)
