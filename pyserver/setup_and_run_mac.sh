@@ -20,7 +20,7 @@ echo "[2/4] Upgrading pip..."
 ./venv/bin/python -m pip install --upgrade pip
 
 echo "[3/4] Installing dependencies..."
-./venv/bin/pip install --disable-pip-version-check --no-input flask flask-cors webauthn
+./venv/bin/pip install --disable-pip-version-check --no-input flask flask-cors webauthn python-dotenv
 
 echo "[4/4] Starting Flask server on http://localhost:5000 ..."
 exec ./venv/bin/python app.py
